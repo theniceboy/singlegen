@@ -6,15 +6,26 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
+	"sync"
 	"time"
 
 	gitignore "github.com/sabhiram/go-gitignore"
 )
 
+// FileEntry represents a file to be processed with its metadata
+type FileEntry struct {
+	path    string
+	info    os.FileInfo
+	content []byte
+	err     error
+}
+
 type IgnoreList struct {
 	gitIgnore    *gitignore.GitIgnore
 	singleIgnore *gitignore.GitIgnore
+	mu           sync.RWMutex
 }
 
 func NewIgnoreList(dir string) (*IgnoreList, error) {
@@ -44,6 +55,9 @@ func NewIgnoreList(dir string) (*IgnoreList, error) {
 }
 
 func (il *IgnoreList) shouldIgnore(path string) bool {
+	il.mu.RLock()
+	defer il.mu.RUnlock()
+
 	// Always ignore specific files and directories
 	switch {
 	case strings.Contains(path, string(filepath.Separator)+".git"+string(filepath.Separator)) ||
@@ -67,30 +81,41 @@ func (il *IgnoreList) shouldIgnore(path string) bool {
 	return false
 }
 
-func processFile(path string, info os.FileInfo, outputFile *os.File) error {
+func processFile(path string, info os.FileInfo) (*FileEntry, error) {
 	if info.IsDir() {
-		return nil
+		return nil, nil
 	}
 
 	file, err := os.Open(path)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	defer file.Close()
 
-	// Write file header with path and metadata
+	content, err := io.ReadAll(file)
+	if err != nil {
+		return nil, err
+	}
+
+	return &FileEntry{
+		path:    path,
+		info:    info,
+		content: content,
+	}, nil
+}
+
+func writeFileEntry(outputFile *os.File, entry *FileEntry) error {
 	header := fmt.Sprintf("\n### File: %s\n### Size: %d bytes\n### Last Modified: %s\n\n",
-		path, info.Size(), info.ModTime().Format("2006-01-02 15:04:05"))
+		entry.path, entry.info.Size(), entry.info.ModTime().Format("2006-01-02 15:04:05"))
+
 	if _, err := outputFile.WriteString(header); err != nil {
 		return err
 	}
 
-	// Copy file content
-	if _, err := io.Copy(outputFile, file); err != nil {
+	if _, err := outputFile.Write(entry.content); err != nil {
 		return err
 	}
 
-	// Add a newline after the file content
 	if _, err := outputFile.WriteString("\n"); err != nil {
 		return err
 	}
@@ -98,10 +123,43 @@ func processFile(path string, info os.FileInfo, outputFile *os.File) error {
 	return nil
 }
 
+func worker(jobs <-chan string, results chan<- *FileEntry, ignoreList *IgnoreList, dirPath string, wg *sync.WaitGroup) {
+	defer wg.Done()
+
+	for path := range jobs {
+		info, err := os.Stat(path)
+		if err != nil {
+			results <- &FileEntry{path: path, err: err}
+			continue
+		}
+
+		relPath, err := filepath.Rel(dirPath, path)
+		if err != nil {
+			results <- &FileEntry{path: path, err: err}
+			continue
+		}
+
+		if ignoreList.shouldIgnore(relPath) {
+			continue
+		}
+
+		entry, err := processFile(path, info)
+		if err != nil {
+			results <- &FileEntry{path: path, err: err}
+			continue
+		}
+
+		if entry != nil {
+			results <- entry
+		}
+	}
+}
+
 func main() {
 	// Parse command line arguments
 	dirPath := flag.String("dir", ".", "Directory to scan (default: current working directory)")
 	outputPath := flag.String("output", "combined_output.txt", "Output file path")
+	workers := flag.Int("workers", runtime.NumCPU(), "Number of worker goroutines")
 	flag.Parse()
 
 	// Create output file
@@ -126,38 +184,59 @@ func main() {
 		os.Exit(1)
 	}
 
-	// Walk through directory
-	err = filepath.Walk(*dirPath, func(path string, info os.FileInfo, err error) error {
-		if err != nil {
-			return err
-		}
+	// Create channels for the worker pool
+	jobs := make(chan string)
+	results := make(chan *FileEntry)
 
-		// Skip the output file itself
-		absOutputPath, _ := filepath.Abs(*outputPath)
-		absPath, _ := filepath.Abs(path)
-		if absPath == absOutputPath {
-			return nil
-		}
+	// Start worker pool
+	var wg sync.WaitGroup
+	for i := 0; i < *workers; i++ {
+		wg.Add(1)
+		go worker(jobs, results, ignoreList, *dirPath, &wg)
+	}
 
-		// Check if path should be ignored
-		relPath, err := filepath.Rel(*dirPath, path)
-		if err != nil {
-			return err
-		}
+	// Start a goroutine to close results channel once all workers are done
+	go func() {
+		wg.Wait()
+		close(results)
+	}()
 
-		if ignoreList.shouldIgnore(relPath) {
-			if info.IsDir() {
-				return filepath.SkipDir
+	// Start a goroutine to walk the directory and send jobs
+	go func() {
+		err := filepath.Walk(*dirPath, func(path string, info os.FileInfo, err error) error {
+			if err != nil {
+				return err
 			}
+
+			// Skip the output file itself
+			absOutputPath, _ := filepath.Abs(*outputPath)
+			absPath, _ := filepath.Abs(path)
+			if absPath == absOutputPath {
+				return nil
+			}
+
+			jobs <- path
 			return nil
+		})
+
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Error walking directory: %v\n", err)
+			os.Exit(1)
 		}
 
-		return processFile(path, info, outputFile)
-	})
+		close(jobs)
+	}()
 
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "Error processing files: %v\n", err)
-		os.Exit(1)
+	// Process results and write to output file
+	for entry := range results {
+		if entry.err != nil {
+			fmt.Fprintf(os.Stderr, "Error processing %s: %v\n", entry.path, entry.err)
+			continue
+		}
+
+		if err := writeFileEntry(outputFile, entry); err != nil {
+			fmt.Fprintf(os.Stderr, "Error writing %s: %v\n", entry.path, err)
+		}
 	}
 
 	fmt.Printf("Successfully combined files into: %s\n", *outputPath)
