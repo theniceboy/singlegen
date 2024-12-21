@@ -64,6 +64,7 @@ func (il *IgnoreList) shouldIgnore(path string) bool {
 		strings.HasPrefix(path, ".git"+string(filepath.Separator)) ||
 		path == ".git" ||
 		path == ".gitignore" ||
+		path == ".DS_Store" ||
 		path == ".singlegenignore":
 		return true
 	}
